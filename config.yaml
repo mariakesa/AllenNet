@@ -1,0 +1,135 @@
+# AllenNet — masked self-supervised LFP encoder.
+# Config for dataset synthesis (inspect_data.py / prepare_dataset.py).
+
+paths:
+  # Root of the AllenSDK EcephysProjectCache download (contains session_*/ dirs).
+  allen_cache: /media/maria/notsudata/AllenNeuropixels
+  # Where the inventory CSV is written / read from.
+  inventory_csv: artifacts/data_inventory.csv
+  # Output directory for the memmap dataset. This whole directory is what ships
+  # to the training machine; it is self-describing and needs no AllenSDK.
+  dataset_dir: /media/maria/notsudata/allennet_pretrain
+
+data:
+  # LFP windows are (window_samples, n_channels).
+  window_samples: 1250        # 1.0 s at 1250 Hz
+  n_channels: 93              # matches the downstream tensor (118, 376, 93)
+  sampling_rate: 1250.0       # verified: median dt = 8.0e-4 s
+  sampling_rate_tol: 5.0      # Hz; reject probes outside fs +/- tol
+
+  # Probes carry 35..96 channels. Keep only those with >= n_channels and crop a
+  # contiguous span so that adjacent columns stay physically adjacent (40 um).
+  # center = drop the extra channels symmetrically from both ends of the shank.
+  channel_crop: center        # one of: center | first | last
+
+  # Total float16 payload to synthesize. 2.5 GB ~= 10.7k windows.
+  target_gb: 2.5
+
+  # Windows are cut non-overlapping (stride == window_samples) inside contiguous
+  # blocks, and the blocks are spread evenly across each recording.
+  stride_samples: 1250
+
+exclusion:
+  # Hard requirement: no natural-scenes data in pretraining.
+  # session: drop every session whose NWB contains natural_scenes presentations
+  #          (i.e. keep only functional-connectivity sessions).  <- strictest
+  # interval: keep such sessions but drop windows overlapping natural_scenes.
+  natural_scenes: session
+  # Additional guard bands (seconds) around every excluded interval.
+  guard_seconds: 2.0
+  # Also drop windows overlapping intervals/invalid_times.
+  drop_invalid_times: true
+
+normalization:
+  # Robust, per-recording, per-channel: z = (x - median) / (1.4826 * MAD).
+  # Never per-window: that would destroy the amplitude structure the encoder
+  # is supposed to learn.
+  method: median_mad
+  mad_floor: 1.0e-9           # guard against dead (zero-variance) channels
+
+quality:
+  max_abs_z: 30.0             # reject window if any sample exceeds this
+  extreme_z: 10.0             # "extreme" sample threshold
+  max_extreme_frac: 0.01      # reject window if >1% of samples are extreme
+  reject_nan: true
+
+  # Neuropixels shanks carry the occasional intermittently-noisy electrode. Probe
+  # 822645899 channel 10 is the clear case here: normal MAD (rank 45/93) but the
+  # largest std on the shank, with 5 mV excursions where its neighbours sit at
+  # 0.14 mV. Window-level QC alone would reject 96% of that probe's windows over
+  # one bad channel out of 93, so bad channels are found per recording and
+  # repaired by interpolating their depth-neighbours (electrodes are 40 um apart,
+  # so this is the standard fix). Recordings with too many bad channels are dropped
+  # outright rather than reconstructed.
+  bad_channel_extreme_frac: 0.02   # channel is bad if >2% of its samples are extreme
+  max_bad_channels: 5              # more than this -> drop the whole recording
+
+split:
+  # Split by session (== mouse in this dataset). Never split random windows from
+  # the same recording: that leaks the recording's statistics across the split.
+  by: session
+  val_fraction: 0.25
+  seed: 0
+
+# ---------------------------------------------------------------------------
+# Masked self-supervised pretraining
+# ---------------------------------------------------------------------------
+
+masking:
+  # Contiguous regions only. Masking isolated samples would be a trivial task:
+  # the network could solve it by averaging the two adjacent samples and would
+  # learn nothing about spatiotemporal structure.
+  min_fraction: 0.40          # target masked fraction, sampled per window
+  max_fraction: 0.60
+  # Relative likelihood of each region type. They are drawn until the target
+  # fraction is reached.
+  weights:
+    temporal_block: 0.4       # all channels, a span of time
+    channel_block: 0.2        # all time, a span of neighbouring channels
+    rectangle: 0.4            # bounded in both
+  temporal_width: [50, 250]   # samples (40 ms .. 200 ms at 1250 Hz)
+  channel_width: [4, 20]      # neighbouring channels
+  max_regions: 200            # safety valve on the draw loop
+
+model:
+  in_channels: 2              # 0 = masked LFP, 1 = binary mask
+  stem_channels: 16
+  mid_channels: 32
+  out_channels: 64
+  embedding_dim: 128          # pooled embedding handed to the downstream decoder
+
+  # How the latent is collapsed into that embedding. Measured on animacy:
+  #   gap  = AdaptiveAvgPool2d(1). Averages the (64, 38, 24) latent over the WHOLE
+  #          300 ms window and the WHOLE shank. Costs ~0.048 AUC: the scene-evoked
+  #          response is a 40-160 ms transient at particular depths, and averaging over
+  #          everything dilutes it into 250 ms of ongoing activity.
+  #   grid = adaptive pool to a small time x depth grid. Keeps a coarse spatiotemporal
+  #          layout, still accepts any input length (1250-sample pretraining windows and
+  #          376-sample trials alike).
+  #   stat = mean and std per feature channel. std carries oscillatory power that a mean
+  #          over a zero-centred signal cannot.
+  pool_mode: grid             # gap | grid | stat
+  pool_grid: [4, 3]           # time x depth cells, used when pool_mode == grid
+  temporal_kernel: 25         # stem
+  spatial_kernel: 5           # spatial compression
+  res_temporal_kernel: 9
+  res_spatial_kernel: 3
+  n_res_blocks: 2             # per stage (32-ch stage and 64-ch stage)
+  groups: 8                   # GroupNorm; never BatchNorm (see model.py)
+  huber_delta: 1.0
+
+training:
+  batch_size: 64
+  epochs: 100
+  lr: 1.0e-3
+  weight_decay: 1.0e-4
+  warmup_epochs: 2
+  grad_clip: 1.0
+  amp: true                   # CUDA only; silently off on CPU
+  num_workers: 4
+  patience: 12                # early stopping on val loss
+  seed: 0
+  run_dir: runs/pretrain
+  # Validation masks are seeded per window index so the val loss is comparable
+  # across epochs; otherwise early stopping is comparing to a moving target.
+  val_mask_seed: 1234

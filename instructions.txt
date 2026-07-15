@@ -1,0 +1,175 @@
+Masked Self-Supervised LFP Encoder — Claude Instructions
+
+Goal
+Build a small PyTorch convolutional encoder that learns from unlabeled Neuropixels LFP using masked spatiotemporal reconstruction, then use the encoder for natural-scenes class decoding.
+
+Data
+- Downstream tensor: (118, 376, 93) = images × timepoints × channels.
+- Pretraining data: fixed-length LFP windows such as (1250, 93).
+- Exclude all natural-scenes recordings from pretraining.
+- Prepare about 2–3 GB of float16 data in a disk-backed NumPy memmap.
+- Store metadata separately: session_id, mouse_id, probe_id, source_file, start_sample, sampling_rate, channel_count, normalization statistics.
+- Split pretraining by session or mouse, never by random windows from the same recording.
+
+Preprocessing
+1. Inspect raw files before assuming format.
+2. Discover LFP files and exclude natural-scenes sessions.
+3. Validate shapes, sampling rates, and channel counts.
+4. Extract mostly non-overlapping fixed-length windows.
+5. Reject NaNs and extreme artifacts.
+6. Normalize per recording using robust per-channel statistics, such as median and MAD.
+7. Do not normalize each window independently to unit variance.
+8. Save windows as float16; convert to float32 in the DataLoader.
+
+Model
+Use a small factorized spatiotemporal convolutional autoencoder.
+
+Input:
+(batch, 2, time, channels)
+
+Input channel 0:
+masked LFP
+
+Input channel 1:
+binary mask
+
+Architecture:
+- Temporal convolutions with kernels shaped (k_time, 1).
+- Spatial convolutions with kernels shaped (1, k_channel).
+- GroupNorm or LayerNorm, not BatchNorm.
+- GELU or SiLU activations.
+- Residual blocks.
+- Adaptive pooling so variable time lengths are supported.
+- Decoder may use interpolation plus convolution.
+- Total trainable parameters: roughly 100k–500k.
+- Encoder must return:
+  1. latent tensor
+  2. pooled embedding of about 64 or 128 dimensions
+
+Suggested starting structure
+- Temporal stem: Conv2d(2, 16, kernel_size=(25,1), stride=(5,1))
+- Spatial compression: Conv2d(16, 32, kernel_size=(1,5), stride=(1,2))
+- Residual blocks with temporal kernels such as (9,1) and spatial kernels such as (1,3)
+- Final block with 64 channels and additional temporal/spatial downsampling
+- Adaptive pooling to a fixed embedding
+
+Masking
+Randomly mask contiguous regions, not isolated samples.
+
+Use a mixture of:
+- temporal blocks
+- neighboring-channel blocks
+- time-channel rectangles
+
+Suggested defaults:
+- total masked fraction: 40–60%
+- temporal width: 50–250 samples
+- channel width: 4–20 channels
+
+The mask must vary every sample and epoch.
+
+Loss
+Compute reconstruction loss only on masked entries.
+
+Use masked Huber loss:
+
+L = sum(M * Huber(X, X_hat)) / sum(M)
+
+where M = 1 on masked entries.
+
+Do not include visible entries in the reconstruction loss.
+
+Training
+Use PyTorch with:
+- AdamW
+- learning rate around 1e-3
+- weight decay around 1e-4
+- mixed precision on CUDA
+- gradient clipping
+- early stopping
+- checkpointing
+- resume support
+- CPU fallback
+- reproducible seeds
+- configurable batch size
+
+Log:
+- training loss
+- validation loss
+- masked-region MAE
+- masked-region Huber loss
+- learning rate
+- epoch time
+
+Save:
+- best encoder checkpoint
+- best full autoencoder checkpoint
+- training history
+- exact config
+
+Files to implement
+- prepare_dataset.py
+- inspect_data.py
+- dataset.py
+- masking.py
+- model.py
+- train.py
+- evaluate_reconstruction.py
+- extract_embeddings.py
+- downstream_decode.py
+- config.yaml
+- synthetic_test.py
+
+Downstream evaluation
+After pretraining:
+1. Discard the decoder.
+2. Encode each natural-scenes response of shape (376, 93).
+3. Produce a 64D or 128D embedding.
+4. Evaluate:
+   - raw flattened logistic regression
+   - PCA + logistic regression
+   - frozen random encoder + logistic regression
+   - frozen pretrained encoder + logistic regression
+   - final-block fine-tuning
+   - optional full fine-tuning
+
+Use leave-one-image-out cross-validation.
+
+Inside every fold:
+- fit scaling only on training images
+- fit PCA only on training images
+- fit classifier only on training images
+- perform any fine-tuning only on training images
+- keep the held-out image completely isolated
+
+Report:
+- accuracy
+- balanced accuracy
+- macro F1
+- confusion matrix
+- per-class recall
+- AUC for animal vs non-animal
+
+Controls
+- pretrained encoder vs random encoder
+- pretrained encoder vs PCA
+- frozen vs fine-tuned encoder
+- label permutation test
+- session-level pretraining split
+- explicit confirmation that natural-scenes data were excluded
+- masked reconstruction plots
+- PCA or UMAP visualization for inspection only
+
+Scientific question
+Does masked self-supervised learning on non-natural-scenes LFP produce a compact representation in which natural-scene class is more linearly accessible than with random features or variance-based baselines?
+
+Implementation requirements
+- Write runnable code, not pseudocode.
+- Use type hints and docstrings.
+- Include explicit shape comments and defensive checks.
+- Provide clear command-line interfaces.
+- Provide example commands.
+- Provide a minimal synthetic-data test.
+- Start by showing the directory structure and exact data flow, then implement files one by one.
+- Do not assume the raw LFP format before inspection.
+- Keep the system simple, reproducible, and suitable for offline local training during a two-week trip.
